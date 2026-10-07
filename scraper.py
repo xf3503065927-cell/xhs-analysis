@@ -202,59 +202,56 @@ async def extract_detail(page, ident, url, payloads):
     return row
 
 
-async def scrape_details(context, links, args, launch_context):
+async def scrape_details(page, links, args, profile_url):
+    """Navigate the existing profile tab; never click anchors or open detail tabs."""
     rows = []
     failures = []
-    closed = False
-    recoveries = 0
+    attempted = 0
+    profile = urlparse(profile_url)
 
-    def on_close(*_):
-        nonlocal closed
-        closed = True
+    def at_home():
+        current = urlparse(page.url)
+        return (current.hostname == profile.hostname
+                and current.path.rstrip('/') == profile.path.rstrip('/'))
 
-    context.on('close', on_close)
     targets = list(links.items())[:args.limit]
     for index, (ident, anchor) in enumerate(targets, 1):
-        detail = None
+        if page.is_closed():
+            print('当前标签页或浏览器已关闭，无法在同一标签页继续；已保存结果保留。')
+            break
+        attempted += 1
         pending = set()
         payloads = []
+
+        async def capture(response):
+            host = urlparse(response.url).hostname or ''
+            if not (host == 'xiaohongshu.com' or host.endswith('.xiaohongshu.com')):
+                return
+            if 'application/json' not in response.headers.get('content-type', ''):
+                return
+            try:
+                payloads.append(await response.json())
+            except Exception:
+                pass
+
+        def on_response(response):
+            task = asyncio.create_task(capture(response))
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+
         try:
+            if not at_home():
+                await page.goto(profile_url, wait_until='domcontentloaded', timeout=60000)
+                await random_pause(args)
             await random_pause(args)
-            if closed:
-                if recoveries >= 2:
-                    raise RuntimeError('浏览器反复关闭，无法继续打开页面')
-                context = await launch_context()
-                closed = False
-                recoveries += 1
-                context.on('close', on_close)
-                print('浏览器已重新打开，复用本地登录资料；若登录失效请手动登录后重试。')
-            # A fresh page isolates each note; a closed note page cannot poison the next.
-            detail = await context.new_page()
-
-            async def capture(response):
-                host = urlparse(response.url).hostname or ''
-                if not (host == 'xiaohongshu.com' or host.endswith('.xiaohongshu.com')):
-                    return
-                if 'application/json' not in response.headers.get('content-type', ''):
-                    return
-                try:
-                    payloads.append(await response.json())
-                except Exception:
-                    pass
-
-            def on_response(response):
-                task = asyncio.create_task(capture(response))
-                pending.add(task)
-                task.add_done_callback(pending.discard)
-
-            detail.on('response', on_response)
+            page.on('response', on_response)
             url = urljoin('https://www.xiaohongshu.com', anchor['href'])
-            await detail.goto(url, wait_until='domcontentloaded', timeout=60000)
+            await page.goto(url, wait_until='domcontentloaded', timeout=60000)
             await random_pause(args)
-            await check_access(detail)
+            await check_access(page)
             if pending:
                 await asyncio.wait(list(pending), timeout=5)
-            row = await extract_detail(detail, ident, url, payloads)
+            row = await extract_detail(page, ident, url, payloads)
             # Write only after detail extraction. Persist successes incrementally.
             save([*rows, row], args.output)
             rows.append(row)
@@ -265,31 +262,30 @@ async def scrape_details(context, links, args, launch_context):
             # Never print exception text: browser diagnostics may include signed URLs.
             print(f'{index}/{len(targets)} 笔记 {ident} 失败（{type(error).__name__}），跳过并继续。')
         finally:
-            # Detach listeners before cancelling, so late responses cannot leak into
-            # the next note's payload list through closures.
-            if detail is not None:
-                detail.remove_listener('response', on_response)
+            page.remove_listener('response', on_response)
             tasks = list(pending)
             for task in tasks:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-            if detail is not None:
+            if not page.is_closed() and not at_home():
                 try:
-                    await detail.close()
-                except Exception:
-                    pass
+                    await random_pause(args)
+                    await page.go_back(wait_until='domcontentloaded', timeout=60000)
+                    await random_pause(args)
+                    # A failed navigation may not have added a history entry.
+                    if not at_home():
+                        await page.goto(profile_url, wait_until='domcontentloaded', timeout=60000)
+                        await random_pause(args)
+                except Exception as error:
+                    print(f'返回主页失败（{type(error).__name__}）；下一条开始前会尝试在同一标签页恢复主页。')
     if failures:
         print('失败笔记 ID：' + ', '.join(failures))
-    print(f'处理完毕：尝试 {len(targets)} 条，保存 {len(rows)} 条，失败 {len(failures)} 条。')
+    print(f'处理完毕：尝试 {attempted}/{len(targets)} 条，保存 {len(rows)} 条，失败 {len(failures)} 条。')
     if rows:
         print(f'CSV：{args.output.resolve()}；无法读取的字段留空。')
     else:
         print('没有成功提取详情；已有 CSV 未覆盖。')
-    try:
-        await context.close()
-    except Exception:
-        pass
 
 
 async def run(args):
@@ -314,7 +310,7 @@ async def run(args):
             for _ in range(args.max_scrolls):
                 before = len(links)
                 anchors = await page.locator('a[href*="/explore/"], a[href*="/discovery/item/"]').evaluate_all(
-                    '''(nodes) => nodes.map(n => ({href:n.href, title:n.innerText.trim(),
+                    '''(nodes) => nodes.map(n => ({href:n.getAttribute('href'), title:n.innerText.trim(),
                        pinned: /置顶/.test((n.closest('section') || n.closest('.note-item') || n).innerText)}))''')
                 for anchor in anchors:
                     ident = note_id(anchor['href'])
@@ -332,7 +328,7 @@ async def run(args):
             if not links:
                 raise RuntimeError('未找到笔记链接。请检查登录和主页可见性；已有 CSV 未覆盖。')
             print('主页链接收集完成；开始逐篇打开详情页。')
-            await scrape_details(context, links, args, launch_context)
+            await scrape_details(page, links, args, profile_url)
         finally:
             try:
                 await context.close()
@@ -346,12 +342,12 @@ def main():
     parser.add_argument('--limit', type=int, default=50, help='最多 50 条')
     parser.add_argument('--output', type=Path, default=Path('data/notes.csv'))
     parser.add_argument('--browser-profile', type=Path, default=Path.home() / '.xhs-scraper-browser')
-    parser.add_argument('--delay-min', type=float, default=1.0, help='随机等待下限秒数，默认 1')
-    parser.add_argument('--delay-max', type=float, default=3.0, help='随机等待上限秒数，默认 3')
+    parser.add_argument('--delay-min', type=float, default=2.0, help='随机等待下限秒数，默认 2')
+    parser.add_argument('--delay-max', type=float, default=4.0, help='随机等待上限秒数，默认 4')
     parser.add_argument('--max-scrolls', type=int, default=40)
     args = parser.parse_args()
-    if not 1 <= args.limit <= 50 or not 1 <= args.delay_min < args.delay_max <= 60 or not 1 <= args.max_scrolls <= 100:
-        parser.error('limit 必须为 1–50，随机等待须满足 1 <= delay-min < delay-max <= 60，max-scrolls 必须为 1–100。')
+    if not 1 <= args.limit <= 50 or not 2 <= args.delay_min < args.delay_max <= 60 or not 1 <= args.max_scrolls <= 100:
+        parser.error('limit 必须为 1–50，随机等待须满足 2 <= delay-min < delay-max <= 60，max-scrolls 必须为 1–100。')
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:
