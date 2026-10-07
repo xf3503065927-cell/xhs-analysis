@@ -99,13 +99,37 @@ async def check_access(page):
         raise RuntimeError('页面出现访问限制或验证。已停止；请在本地手动处理后重新运行，不绕过验证。')
 
 
+def validate_profile_url(value):
+    """Validate only host/path, preserving the original signed query verbatim."""
+    url = value.strip()
+    # Accept copied Markdown links and enclosing quotation marks/angle brackets.
+    markdown = re.fullmatch(r'\[[^\]]*\]\((https://[^\s]+)\)', url)
+    if markdown:
+        url = markdown.group(1)
+    wrappers = {'"': '"', "'": "'", '“': '”', '‘': '’', '<': '>'}
+    if len(url) >= 2 and wrappers.get(url[0]) == url[-1]:
+        url = url[1:-1].strip()
+    if any(char.isspace() for char in url):
+        raise ValueError('链接中包含空白字符。请复制完整主页 URL，并在命令行用英文双引号包住整个链接。')
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError:
+        raise ValueError('链接格式无效。请复制浏览器地址栏中的完整主页 URL。') from None
+    if (parsed.scheme.lower() != 'https'
+            or parsed.hostname not in ('www.xiaohongshu.com', 'xiaohongshu.com')
+            or parsed.username is not None or parsed.password is not None
+            or port not in (None, 443)):
+        raise ValueError('请提供 https://www.xiaohongshu.com 的博主主页链接；支持 xsec_token 等查询参数。请勿输入“我的完整链接”占位文字。')
+    # Query parameters (?xsec_token=...&xsec_source=...) are not part of path.
+    match = re.fullmatch(r'/user/profile/([a-fA-F0-9]{24})/?', parsed.path)
+    if not match:
+        raise ValueError('链接必须是 /user/profile/ 后跟完整的 24 位用户 ID；可携带任意查询参数，请勿用省略号替代 ID。')
+    return url, match.group(1)
+
+
 async def run(args):
-    parsed = urlparse(args.profile_url)
-    if parsed.scheme != 'https' or parsed.hostname not in ('www.xiaohongshu.com', 'xiaohongshu.com'):
-        raise ValueError('请提供 https://www.xiaohongshu.com 的博主主页链接。')
-    if not re.fullmatch(r'/user/profile/[a-f0-9]{24}/?', parsed.path):
-        raise ValueError('链接必须是博主主页 /user/profile/<id>。')
-    profile_id = parsed.path.rstrip('/').split('/')[-1]
+    profile_url, profile_id = validate_profile_url(args.profile_url)
     rows = []
     cache = {}
     pending = set()
@@ -147,11 +171,11 @@ async def run(args):
         context.on('response', on_response)
         page = context.pages[0] if context.pages else await context.new_page()
         try:
-            await page.goto(args.profile_url, wait_until='domcontentloaded', timeout=60000)
+            await page.goto(profile_url, wait_until='domcontentloaded', timeout=60000)
             print('请在浏览器中手动登录，确认目标主页的笔记列表可见，并选择最新排序（如有）。')
             await asyncio.to_thread(input, '准备好后按 Enter 开始；Ctrl+C 取消：')
             if profile_id not in urlparse(page.url).path:
-                await page.goto(args.profile_url, wait_until='domcontentloaded', timeout=60000)
+                await page.goto(profile_url, wait_until='domcontentloaded', timeout=60000)
             await check_access(page)
             links = {}
             unchanged = 0
