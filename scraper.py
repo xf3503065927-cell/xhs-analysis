@@ -15,13 +15,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
-import json
+import random
 import re
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright.async_api import async_playwright
 
 DEFAULT_PROFILE = 'https://www.xiaohongshu.com/user/profile/6823166e000000000e02d382'
 FIELDS = ['笔记标题', '笔记链接', '发布时间', '内容形式', '点赞数', '收藏数', '评论数', '话题标签']
@@ -128,51 +128,183 @@ def validate_profile_url(value):
     return url, match.group(1)
 
 
+async def random_pause(args):
+    # Pacing only; no fingerprint changes or verification bypass.
+    await asyncio.sleep(random.uniform(args.delay_min, args.delay_max))
+
+
+def detail_note(payload, ident):
+    result = {}
+    for item in objects(payload):
+        candidate = first(item, 'note_id', 'noteId', 'id')
+        note = item if candidate == ident else item.get(ident, {})
+        if isinstance(note, dict):
+            note = note.get('note', note.get('noteCard', note.get('note_card', note)))
+            if isinstance(note, dict) and any(key in note for key in ('title', 'desc', 'interactInfo', 'interact_info')):
+                for key, value in note.items():
+                    if value is not None and value != '':
+                        if isinstance(value, dict) and isinstance(result.get(key), dict):
+                            result[key] = {**result[key], **value}
+                        else:
+                            result[key] = value
+    return result
+
+
+async def extract_detail(page, ident, url, payloads):
+    # Wait for detail rendering rather than assuming that navigation means ready.
+    await page.locator('#noteContainer, .note-detail, .note-content').first.wait_for(
+        state='visible', timeout=20000)
+    await check_access(page)
+    state = await page.evaluate('''() => {
+        try { return JSON.parse(JSON.stringify(window.__INITIAL_STATE__ || {},
+          (key, value) => value === undefined ? null : value)); }
+        catch (_) { return {}; }
+    }''')
+    note = {}
+    for payload in [*payloads, state]:
+        for key, value in detail_note(payload, ident).items():
+            if isinstance(value, dict) and isinstance(note.get(key), dict):
+                note[key] = {**note[key], **value}
+            else:
+                note[key] = value
+    row = row_from(note, url)
+    dom = await page.evaluate(r'''() => {
+        const root = document.querySelector('#noteContainer, .note-detail') || document;
+        const text = (selectors) => {
+            for (const selector of selectors) {
+                const element = root.querySelector(selector);
+                if (element && element.textContent.trim()) return element.textContent.trim();
+            }
+            return '';
+        };
+        const count = (selectors) => {
+            const value = text(selectors);
+            const match = value.match(/[0-9]+(?:[.,][0-9]+)*(?:万|亿|千|[kKwWmM])?\+?/);
+            return match ? match[0] : ''; // A label without a number is unknown, not zero.
+        };
+        const time = root.querySelector('time[datetime]');
+        return {
+            '笔记标题': text(['#detail-title', '.note-content .title', '.title']),
+            '发布时间': time ? time.getAttribute('datetime') : text(['.bottom-container .date', '.note-content .date', '.date']),
+            '点赞数': count(['.like-wrapper .count', '.like-wrapper', '[aria-label*="点赞"]']),
+            '收藏数': count(['.collect-wrapper .count', '.collect-wrapper', '[aria-label*="收藏"]']),
+            '评论数': count(['.chat-wrapper .count', '.comment-wrapper .count', '.chat-wrapper', '[aria-label*="评论"]']),
+            '话题标签': [...new Set([...root.querySelectorAll('#detail-desc a.tag, .note-content a.tag, a[href*="/search_result?keyword=%23"]')]
+                .map(n => n.textContent.trim().replace(/^#/, '')).filter(Boolean))].join('|'),
+            '内容形式': root.querySelector('video') ? '视频' : (root.querySelector('.swiper img, .note-slider img') ? '图文' : '')
+        };
+    }''')
+    for key, value in dom.items():
+        if row[key] == '' and value:
+            row[key] = value
+    if not row['笔记标题'] and not note:
+        raise RuntimeError('详情未加载或页面结构已变化')
+    return row
+
+
+async def scrape_details(context, links, args, launch_context):
+    rows = []
+    failures = []
+    closed = False
+    recoveries = 0
+
+    def on_close(*_):
+        nonlocal closed
+        closed = True
+
+    context.on('close', on_close)
+    targets = list(links.items())[:args.limit]
+    for index, (ident, anchor) in enumerate(targets, 1):
+        detail = None
+        pending = set()
+        payloads = []
+        try:
+            await random_pause(args)
+            if closed:
+                if recoveries >= 2:
+                    raise RuntimeError('浏览器反复关闭，无法继续打开页面')
+                context = await launch_context()
+                closed = False
+                recoveries += 1
+                context.on('close', on_close)
+                print('浏览器已重新打开，复用本地登录资料；若登录失效请手动登录后重试。')
+            # A fresh page isolates each note; a closed note page cannot poison the next.
+            detail = await context.new_page()
+
+            async def capture(response):
+                host = urlparse(response.url).hostname or ''
+                if not (host == 'xiaohongshu.com' or host.endswith('.xiaohongshu.com')):
+                    return
+                if 'application/json' not in response.headers.get('content-type', ''):
+                    return
+                try:
+                    payloads.append(await response.json())
+                except Exception:
+                    pass
+
+            def on_response(response):
+                task = asyncio.create_task(capture(response))
+                pending.add(task)
+                task.add_done_callback(pending.discard)
+
+            detail.on('response', on_response)
+            url = urljoin('https://www.xiaohongshu.com', anchor['href'])
+            await detail.goto(url, wait_until='domcontentloaded', timeout=60000)
+            await random_pause(args)
+            await check_access(detail)
+            if pending:
+                await asyncio.wait(list(pending), timeout=5)
+            row = await extract_detail(detail, ident, url, payloads)
+            # Write only after detail extraction. Persist successes incrementally.
+            save([*rows, row], args.output)
+            rows.append(row)
+            missing = [key for key in FIELDS if row[key] == '']
+            print(f'{index}/{len(targets)} 详情已保存' + (f'；缺失字段：{", ".join(missing)}' if missing else ''))
+        except Exception as error:
+            failures.append(ident)
+            # Never print exception text: browser diagnostics may include signed URLs.
+            print(f'{index}/{len(targets)} 笔记 {ident} 失败（{type(error).__name__}），跳过并继续。')
+        finally:
+            # Detach listeners before cancelling, so late responses cannot leak into
+            # the next note's payload list through closures.
+            if detail is not None:
+                detail.remove_listener('response', on_response)
+            tasks = list(pending)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if detail is not None:
+                try:
+                    await detail.close()
+                except Exception:
+                    pass
+    if failures:
+        print('失败笔记 ID：' + ', '.join(failures))
+    print(f'处理完毕：尝试 {len(targets)} 条，保存 {len(rows)} 条，失败 {len(failures)} 条。')
+    if rows:
+        print(f'CSV：{args.output.resolve()}；无法读取的字段留空。')
+    else:
+        print('没有成功提取详情；已有 CSV 未覆盖。')
+    try:
+        await context.close()
+    except Exception:
+        pass
+
+
 async def run(args):
     profile_url, profile_id = validate_profile_url(args.profile_url)
-    rows = []
-    cache = {}
-    pending = set()
     async with async_playwright() as playwright:
-        context = await playwright.chromium.launch_persistent_context(
-            str(args.browser_profile.resolve()), headless=False,
-            viewport={'width': 1280, 'height': 900}, locale='zh-CN',
-        )
+        async def launch_context():
+            return await playwright.chromium.launch_persistent_context(
+                str(args.browser_profile.resolve()), headless=False,
+                viewport={'width': 1280, 'height': 900}, locale='zh-CN')
 
-        async def capture(response):
-            # Read JSON already delivered to the visible browser, never call private APIs.
-            host = urlparse(response.url).hostname or ''
-            if not (host == 'xiaohongshu.com' or host.endswith('.xiaohongshu.com')):
-                return
-            if 'application/json' not in response.headers.get('content-type', ''):
-                return
-            try:
-                data = await response.json()
-                for item in objects(data):
-                    ident = first(item, 'note_id', 'noteId', 'id')
-                    if not isinstance(ident, str) or not re.fullmatch('[a-f0-9]{24}', ident):
-                        continue
-                    if not any(key in item for key in ('title', 'display_title', 'displayTitle', 'desc')):
-                        continue
-                    if first(item, 'type', 'note_type', 'noteType') not in ('normal', 'image', 'video'):
-                        continue
-                    cache[ident] = {**cache.get(ident, {}), **item}
-            except (ValueError, PlaywrightTimeout):
-                pass
-            except Exception:
-                # Some responses disappear during navigation; DOM remains a fallback.
-                pass
-
-        def on_response(response):
-            task = asyncio.create_task(capture(response))
-            pending.add(task)
-            task.add_done_callback(pending.discard)
-
-        context.on('response', on_response)
+        context = await launch_context()
         page = context.pages[0] if context.pages else await context.new_page()
         try:
             await page.goto(profile_url, wait_until='domcontentloaded', timeout=60000)
-            print('请在浏览器中手动登录，确认目标主页的笔记列表可见，并选择最新排序（如有）。')
+            print('请手动登录，确认主页笔记列表可见，并选择最新排序（如有）。')
             await asyncio.to_thread(input, '准备好后按 Enter 开始；Ctrl+C 取消：')
             if profile_id not in urlparse(page.url).path:
                 await page.goto(profile_url, wait_until='domcontentloaded', timeout=60000)
@@ -183,8 +315,7 @@ async def run(args):
                 before = len(links)
                 anchors = await page.locator('a[href*="/explore/"], a[href*="/discovery/item/"]').evaluate_all(
                     '''(nodes) => nodes.map(n => ({href:n.href, title:n.innerText.trim(),
-                       pinned: /置顶/.test((n.closest('section') || n.closest('.note-item') || n).innerText)}))'''
-                )
+                       pinned: /置顶/.test((n.closest('section') || n.closest('.note-item') || n).innerText)}))''')
                 for anchor in anchors:
                     ident = note_id(anchor['href'])
                     if ident and ident not in links and not anchor['pinned']:
@@ -196,48 +327,17 @@ async def run(args):
                 if unchanged >= 5:
                     break
                 await page.mouse.wheel(0, 900)
-                await page.wait_for_timeout(args.delay * 1000)
+                await random_pause(args)
                 await check_access(page)
             if not links:
-                raise RuntimeError('未找到笔记链接。请检查登录、主页可见性或页面结构；未覆盖已有 CSV。')
-            print('按主页最新顺序读取，跳过页面明确标记的置顶笔记；请确保主页未选择热门排序。')
-            detail = await context.new_page()
-            for ident, anchor in list(links.items())[:args.limit]:
-                url = urljoin('https://www.xiaohongshu.com', anchor['href'])
-                try:
-                    await detail.goto(url, wait_until='domcontentloaded', timeout=60000)
-                    await detail.wait_for_timeout(args.delay * 1000)
-                    await check_access(detail)
-                    state = await detail.evaluate('''() => {
-                        try { return JSON.parse(JSON.stringify(window.__INITIAL_STATE__ || {},
-                          (key, value) => value === undefined ? null : value)); }
-                        catch (_) { return {}; }
-                    }''')
-                    for item in objects(state):
-                        candidate = first(item, 'note_id', 'noteId', 'id')
-                        if candidate == ident and any(k in item for k in ('title', 'desc', 'interactInfo', 'interact_info')):
-                            cache[ident] = {**cache.get(ident, {}), **item}
-                    if pending:
-                        await asyncio.gather(*list(pending), return_exceptions=True)
-                    row = row_from(cache.get(ident, {}), url)
-                    if not row['笔记标题']:
-                        title = detail.locator('#detail-title, .note-detail .title').first
-                        row['笔记标题'] = (await title.inner_text()).strip() if await title.count() else anchor['title']
-                    if not row['话题标签']:
-                        tags = await detail.locator('#detail-desc a.tag, .note-detail a.tag').all_text_contents()
-                        row['话题标签'] = '|'.join(tag.strip().lstrip('#') for tag in tags)
-                    rows.append(row)
-                    save(rows, args.output)
-                    missing = [key for key in FIELDS if row[key] == '']
-                    print(f'{len(rows)}/{min(args.limit, len(links))} 已保存' + (f'；缺失字段：{", ".join(missing)}' if missing else ''))
-                except PlaywrightTimeout:
-                    print('笔记加载超时，停止并保留已保存结果。请检查本地网络后重试。')
-                    break
-            print(f'完成：{len(rows)} 条，文件：{args.output.resolve()}。缺失值为空，计数保留网站显示格式。')
+                raise RuntimeError('未找到笔记链接。请检查登录和主页可见性；已有 CSV 未覆盖。')
+            print('主页链接收集完成；开始逐篇打开详情页。')
+            await scrape_details(context, links, args, launch_context)
         finally:
-            if pending:
-                await asyncio.gather(*list(pending), return_exceptions=True)
-            await context.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
 
 
 def main():
@@ -246,11 +346,12 @@ def main():
     parser.add_argument('--limit', type=int, default=50, help='最多 50 条')
     parser.add_argument('--output', type=Path, default=Path('data/notes.csv'))
     parser.add_argument('--browser-profile', type=Path, default=Path.home() / '.xhs-scraper-browser')
-    parser.add_argument('--delay', type=float, default=3.0, help='页面加载和滚动间隔秒数，至少 2 秒')
+    parser.add_argument('--delay-min', type=float, default=1.0, help='随机等待下限秒数，默认 1')
+    parser.add_argument('--delay-max', type=float, default=3.0, help='随机等待上限秒数，默认 3')
     parser.add_argument('--max-scrolls', type=int, default=40)
     args = parser.parse_args()
-    if not 1 <= args.limit <= 50 or args.delay < 2 or not 1 <= args.max_scrolls <= 100:
-        parser.error('limit 必须为 1–50，delay 至少为 2，max-scrolls 必须为 1–100。')
+    if not 1 <= args.limit <= 50 or not 1 <= args.delay_min < args.delay_max <= 60 or not 1 <= args.max_scrolls <= 100:
+        parser.error('limit 必须为 1–50，随机等待须满足 1 <= delay-min < delay-max <= 60，max-scrolls 必须为 1–100。')
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:
